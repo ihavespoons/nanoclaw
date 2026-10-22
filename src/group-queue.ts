@@ -1,12 +1,14 @@
 import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 
 import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
   id: string;
+  runId: string;
   groupJid: string;
   fn: () => Promise<void>;
 }
@@ -22,6 +24,7 @@ interface GroupState {
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
+  activeTaskIds: Set<string>;
 }
 
 export class GroupQueue {
@@ -43,6 +46,7 @@ export class GroupQueue {
         containerName: null,
         groupFolder: null,
         retryCount: 0,
+        activeTaskIds: new Set(),
       };
       this.groups.set(groupJid, state);
     }
@@ -84,6 +88,12 @@ export class GroupQueue {
 
     const state = this.getGroup(groupJid);
 
+    // Prevent double-queuing of the same task while it is active
+    if (state.activeTaskIds.has(taskId)) {
+      logger.debug({ groupJid, taskId }, 'Task already active, skipping');
+      return;
+    }
+
     // Prevent double-queuing of the same task
     if (state.pendingTasks.some((t) => t.id === taskId)) {
       logger.debug({ groupJid, taskId }, 'Task already queued, skipping');
@@ -91,13 +101,13 @@ export class GroupQueue {
     }
 
     if (state.active) {
-      state.pendingTasks.push({ id: taskId, groupJid, fn });
+      state.pendingTasks.push({ id: taskId, runId: randomUUID(), groupJid, fn });
       logger.debug({ groupJid, taskId }, 'Container active, task queued');
       return;
     }
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
-      state.pendingTasks.push({ id: taskId, groupJid, fn });
+      state.pendingTasks.push({ id: taskId, runId: randomUUID(), groupJid, fn });
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
       }
@@ -109,7 +119,7 @@ export class GroupQueue {
     }
 
     // Run immediately
-    this.runTask(groupJid, { id: taskId, groupJid, fn });
+    this.runTask(groupJid, { id: taskId, runId: randomUUID(), groupJid, fn });
   }
 
   registerProcess(groupJid: string, proc: ChildProcess, containerName: string, groupFolder?: string): void {
@@ -196,6 +206,7 @@ export class GroupQueue {
   private async runTask(groupJid: string, task: QueuedTask): Promise<void> {
     const state = this.getGroup(groupJid);
     state.active = true;
+    state.activeTaskIds.add(task.id);
     this.activeCount++;
 
     logger.debug(
@@ -209,6 +220,7 @@ export class GroupQueue {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
       state.active = false;
+      state.activeTaskIds.delete(task.id);
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
